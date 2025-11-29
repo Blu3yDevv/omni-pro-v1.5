@@ -7,7 +7,7 @@ import time
 import uuid
 import queue
 import threading
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -24,7 +24,6 @@ from guardrails import (
 )
 from logging_utils import log_interaction
 from config import config, RuntimeConfig
-
 
 # ---------------------------------------------------------------------------
 # Environment & app setup
@@ -78,15 +77,15 @@ class ChatMessage(BaseModel):
 
 
 class OmniConfigBody(BaseModel):
-    # High-level routing knobs (Phase 1: wired minimally, can be extended)
+    # High-level routing knobs
     runtime_mode: Optional[Literal["balanced", "turbo", "deep"]] = None
     use_judge: Optional[bool] = None
     debug: Optional[bool] = None
 
-    # Whether to include internal traces (planner/researcher/evidence/judge) in response
+    # Whether to include internal traces in response
     return_traces: bool = False
 
-    # Keep <think>…</think> markers so your frontend can show expandable thinking
+    # Whether to keep <think> markers in final output
     tag_thinking: bool = True
 
 
@@ -94,17 +93,14 @@ class ChatCompletionRequest(BaseModel):
     model: str = Field(default="omni-pro-v1", description="Logical model name, e.g. omni-pro-v1")
     messages: List[ChatMessage]
 
-    # OpenAI-like generation parameters (currently mostly placeholders).
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     stream: bool = False
 
-    # For your own attribution and logging
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
-    # Omni-specific config
     omni: OmniConfigBody = Field(default_factory=OmniConfigBody)
 
 
@@ -130,7 +126,7 @@ class ChatCompletionResponse(BaseModel):
 
 def _split_history_and_user(
     messages: List[ChatMessage],
-) -> tuple[List[Dict[str, str]], str]:
+) -> Tuple[List[Dict[str, str]], str]:
     """
     Convert OpenAI-style messages into:
       - chat_history (all but last message),
@@ -157,11 +153,6 @@ class _RuntimeOverride:
     """
     Context manager to temporarily override config.runtime
     for a single request.
-
-    NOTE: This is not perfectly thread-safe for heavy parallel load,
-    but it's fine for a single Render instance with modest traffic.
-    For serious scale you'd refactor to pass runtime into run_multi_agent
-    instead of using a global.
     """
 
     def __init__(self, omni_cfg: OmniConfigBody):
@@ -201,9 +192,7 @@ def create_chat_completion(
     Main non-streaming endpoint. Returns a single ChatCompletionResponse.
     """
     if body.stream:
-        # OpenAI-style: clients should call the same path with stream=true,
-        # but FastAPI needs a different return type. We redirect to the
-        # streaming handler for convenience.
+        # If client passed stream=true, use streaming handler
         return _streaming_chat_completion(body)
 
     chat_history, user_input_raw = _split_history_and_user(body.messages)
@@ -212,7 +201,6 @@ def create_chat_completion(
     if is_disallowed(user_input_raw):
         answer = safe_refusal_message()
         final_answer = postprocess_model_output(answer)
-        # Still log the attempt
         try:
             log_interaction(
                 user_input=user_input_raw,
@@ -245,14 +233,12 @@ def create_chat_completion(
         final_answer, agent_traces = run_multi_agent(
             processed_input,
             chat_history=chat_history,
-            # Non-streaming mode here
             stream_final=False,
             stream_callback=None,
         )
 
     final_answer = postprocess_model_output(final_answer)
 
-    # Log the interaction (you can later replace this with Supabase logging)
     try:
         log_interaction(
             user_input=user_input_raw,
@@ -270,7 +256,6 @@ def create_chat_completion(
         "used_judge": "judge" in agent_traces,
     }
     if body.omni.return_traces:
-        # Warning: these can be long. Frontend should decide what to display.
         omni_meta["traces"] = agent_traces
 
     resp = ChatCompletionResponse(
@@ -305,14 +290,10 @@ def _streaming_chat_completion(body: ChatCompletionRequest):
       - Content-Type: text/event-stream
       - Each line:   data: {json}\n\n
       - Final line:  data: [DONE]\n\n
-
-    This is similar to OpenAI's streaming format and can be consumed with
-    EventSource / fetch + ReadableStream on the frontend.
     """
     chat_history, user_input_raw = _split_history_and_user(body.messages)
 
     if is_disallowed(user_input_raw):
-        # For simplicity, refuse streaming for disallowed content.
         raise HTTPException(status_code=400, detail="Request content is not allowed.")
 
     processed_input = preprocess_user_input(user_input_raw)
@@ -328,37 +309,64 @@ def _streaming_chat_completion(body: ChatCompletionRequest):
     created = int(time.time())
 
     def on_chunk(text: str) -> None:
+        """
+        Called by run_multi_agent whenever a partial token is ready.
+        We just push it into the queue for the StreamingResponse generator.
+        """
         if not text:
             return
         token_queue.put(text)
 
     def worker():
         try:
-            with _RuntimeOverride(body.omni):
-                final_answer, agent_traces = run_multi_agent(
-                    processed_input,
-                    chat_history=chat_history,
-                    stream_final=True,
-                    stream_callback=on_chunk,
-                )
-            final_answer = postprocess_model_output(final_answer)
-            result_holder["final_answer"] = final_answer
-            result_holder["agent_traces"] = agent_traces
+          with _RuntimeOverride(body.omni):
+              final_answer, agent_traces = run_multi_agent(
+                  processed_input,
+                  chat_history=chat_history,
+                  stream_final=True,
+                  stream_callback=on_chunk,
+              )
+          final_answer = postprocess_model_output(final_answer)
+          result_holder["final_answer"] = final_answer
+          result_holder["agent_traces"] = agent_traces
         except Exception as e:
-            result_holder["error"] = str(e)
+          result_holder["error"] = str(e)
         finally:
-            # Sentinel to end the stream
-            token_queue.put(None)
+          # Sentinel to end the stream
+          token_queue.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
 
     def event_generator():
         first_chunk = True
+        any_chunk = False
+
         while True:
             chunk = token_queue.get()
             if chunk is None:
-                # Optional: send a final summary event or just [DONE]
+                # If no chunk was streamed but we have a final_answer,
+                # send it one-shot so the client still gets a reply.
+                if not any_chunk and result_holder["final_answer"]:
+                    payload = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": body.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": result_holder["final_answer"],
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
                 yield "data: [DONE]\n\n"
+
                 # Log after stream completes
                 if result_holder["final_answer"]:
                     try:
@@ -370,6 +378,8 @@ def _streaming_chat_completion(body: ChatCompletionRequest):
                     except Exception:
                         pass
                 break
+
+            any_chunk = True
 
             delta: Dict[str, Any] = {"content": chunk}
             if first_chunk:
