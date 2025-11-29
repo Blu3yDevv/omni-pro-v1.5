@@ -18,7 +18,6 @@ from llm_client import (
 
 from tools import fast_tool_router
 from tools import deep_web_search  # if this import exists in your version
-  # canonical web search wrapper
 from rag_db import retrieve_rag_context
 from config import config
 from terminal_ui import (
@@ -99,7 +98,7 @@ def _extract_json_dict(raw: str) -> Dict[str, Any] | None:
         start = raw.find("{")
         end = raw.rfind("}")
         if start != -1 and end != -1 and end > start:
-            candidate = raw[start : end + 1]
+            candidate = raw[start: end + 1]
             data = json.loads(candidate)
             if isinstance(data, dict):
                 return data
@@ -186,6 +185,8 @@ class AgentEnvironment:
     Phase 2 additions:
     - history_max_turns / history_max_chars: planner-controlled context window
     - web_depth: planner-controlled web search depth ("none"/"light"/"deep"/"auto")
+    - status_callback: optional callback to push lightweight status events outward
+                       (e.g., to a web UI); signature: status_callback(dict).
     """
     user_input: str
     chat_history: List[Dict[str, str]] = field(default_factory=list)
@@ -199,10 +200,28 @@ class AgentEnvironment:
     history_max_chars: int = MAX_HISTORY_CHARS
     web_depth: str = "auto"
 
+    # Optional outbound status hook (e.g. to the API / website)
+    status_callback: Optional[callable] = field(default=None, repr=False)
+
     # --- Logging helpers ---------------------------------------------------
 
     def log(self, message: str) -> None:
+        """
+        Append a message to the internal activity_log and also emit it via
+        status_callback (if provided) as a lightweight env_log event.
+        """
         self.activity_log.append(message)
+        if self.status_callback is not None:
+            try:
+                self.status_callback(
+                    {
+                        "type": "env_log",
+                        "message": message,
+                    }
+                )
+            except Exception:
+                # Never let a bad UI callback kill the main run.
+                pass
 
     # alias for compatibility with older code
     def log_event(self, text: str) -> None:
@@ -329,15 +348,12 @@ class AgentEnvironment:
             joined = joined[-max_chars:]
         return joined or "None."
 
-
     def all_agent_outputs(self) -> Dict[str, str]:
         """
         Return a shallow copy of all agent outputs.
         Useful when you want to return everything at once.
         """
         return dict(self.agent_outputs)
-
-
 
     # --- Snapshot for prompts / logging ------------------------------------
 
@@ -705,7 +721,6 @@ Return ONLY the JSON object described above.
     )
     env.log("[planner] finished")
     return decision
-
 
 
 def planner_agent(user_input: str) -> PlannerDecision:
@@ -1608,7 +1623,6 @@ Write the final answer for the user now.
     return final_answer
 
 
-
 def concluder_agent(
     user_input: str,
     research_summary: str,
@@ -1627,55 +1641,12 @@ def concluder_agent(
 # Pipeline Orchestrator + Agent Status
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tool-router shortcut (math/time etc.) before full agent stack
-# ---------------------------------------------------------------------------
-
-def try_tool_route(user_input: str) -> Tuple[bool, str, str]:
-    """
-    Lightweight shortcut before spinning up the full multi-agent pipeline.
-
-    Delegates to fast_tool_router() from tools.py.
-
-    Returns:
-        used_tool: whether a tool produced a direct answer.
-        answer:    the tool's final answer text (or "" if none).
-        tool_name: short human-readable name of the tool used (for logging/UI).
-    """
-    try:
-        result = fast_tool_router(user_input)
-    except Exception:
-        # If the tool router fails for any reason, fall back to normal agents.
-        return False, "", ""
-
-    # Allow a few possible shapes from fast_tool_router.
-    if isinstance(result, tuple):
-        if len(result) == 3:
-            used, answer, name = result
-        elif len(result) == 2:
-            used, answer = result
-            name = "tool"
-        else:
-            return False, "", ""
-    else:
-        # If router returns something unexpected, ignore and use full pipeline.
-        return False, "", ""
-
-    used = bool(used)
-    answer = str(answer) if answer is not None else ""
-    name = str(name) if name is not None else "tool"
-
-    if not used or not answer.strip():
-        return False, "", ""
-
-    return True, answer, name
-
-
 def run_multi_agent(
     user_input: str,
     chat_history: Optional[List[Dict[str, str]]] = None,
     stream_final: bool = False,
     stream_callback: Optional[callable] = None,
+    status_callback: Optional[callable] = None,
 ) -> Tuple[str, Dict[str, str]]:
     """
     Orchestrates:
@@ -1688,13 +1659,38 @@ def run_multi_agent(
         streams tokens. No agent boxes or judge messages are printed after the
         streamed answer, so the answer stays as the last AI content on screen.
       - Tool fast paths are returned directly (no streaming from here).
+
+    status_callback:
+      - Optional callable that, if provided, is invoked with small dict payloads
+        whenever a stage starts/finishes, e.g.:
+
+        { "type": "status", "stage": "planner", "state": "started" }
+
+      - This is designed so your API layer can forward these to the website
+        (for the "Thinking" / per-agent status UI) without touching terminal UI.
     """
     agent_traces: Dict[str, str] = {}
+
+    def emit_status(stage: str, state: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Internal helper to push status events outward via status_callback.
+        """
+        if status_callback is None:
+            return
+        payload: Dict[str, Any] = {"type": "status", "stage": stage, "state": state}
+        if extra:
+            payload.update(extra)
+        try:
+            status_callback(payload)
+        except Exception:
+            # Never let a UI callback crash the main pipeline.
+            pass
 
     # 0) Tool shortcut (simple math / time / etc.)
     used_tool, tool_answer, tool_name = fast_tool_router(user_input)
     if used_tool:
         print_status(f"Tool route: {tool_name} used. Skipping agents.", color=FG_GREEN)
+        emit_status("router", "completed", {"tool": tool_name})
 
         # No streaming for tool route; just return the tool answer.
         if stream_final and stream_callback is not None:
@@ -1705,10 +1701,15 @@ def run_multi_agent(
         agent_traces["final"] = final_answer
         return final_answer, agent_traces
 
-    env = AgentEnvironment(user_input=user_input, chat_history=chat_history or [])
+    env = AgentEnvironment(
+        user_input=user_input,
+        chat_history=chat_history or [],
+        status_callback=status_callback,
+    )
 
     # 1) Planner
     print_status("Planner Thinking...", color=FG_CYAN)
+    emit_status("planner", "started")
     t0 = time.time()
     decision = _planner_agent_env(env)
     planner_text = env.get_agent_output("planner")
@@ -1717,25 +1718,13 @@ def run_multi_agent(
         print_box("Planner Output", planner_text, color=FG_CYAN)
         print_box("Env Snapshot After Planner", env.snapshot_for_prompt("debug-planner"), color=FG_MAGENTA)
     print_status(f"Planner Finished. ({time.time() - t0:.2f}s)", color=FG_CYAN)
-
-    # --- math_or_time fast path controlled by Planner ----------------------
-    if decision.mode == "math_or_time":
-        print_status("Planner selected math_or_time fast path. Using internal handler.", color=FG_GREEN)
-        answer = _handle_math_or_time(env.user_input)
-        env.set_agent_output("final", answer)
-
-        if stream_final and stream_callback is not None:
-            stream_callback(answer)
-
-        agent_traces["final"] = answer
-        agent_traces["mode"] = "math_or_time"
-        return answer, agent_traces
-    # -----------------------------------------------------------------------
+    emit_status("planner", "finished", {"mode": decision.mode})
 
     # 2) Optional Researcher
     research_summary = ""
     if decision.use_researcher:
         print_status("Researcher Searching Web & Internal DB...", color=FG_GREEN)
+        emit_status("researcher", "started")
         t1 = time.time()
         research_summary = _researcher_agent_env(env, decision)
         agent_traces["researcher"] = research_summary
@@ -1743,11 +1732,13 @@ def run_multi_agent(
             print_box("Researcher Output", research_summary, color=FG_GREEN)
             print_box("Env Snapshot After Researcher", env.snapshot_for_prompt("debug-researcher"), color=FG_MAGENTA)
         print_status(f"Researcher Summary Ready. ({time.time() - t1:.2f}s)", color=FG_GREEN)
+        emit_status("researcher", "finished")
 
     # 3) Optional Evidence
     evidence_pack = ""
     if decision.use_evidence and research_summary:
         print_status("Evidence Analyst Verifying Claims & Sources...", color=FG_MAGENTA)
+        emit_status("evidence", "started")
         t2 = time.time()
         evidence_pack = _evidence_agent_env(env, research_summary)
         agent_traces["evidence"] = evidence_pack
@@ -1755,6 +1746,7 @@ def run_multi_agent(
             print_box("Evidence Output", evidence_pack, color=FG_MAGENTA)
             print_box("Env Snapshot After Evidence", env.snapshot_for_prompt("debug-evidence"), color=FG_MAGENTA)
         print_status(f"Evidence Pack Ready. ({time.time() - t2:.2f}s)", color=FG_MAGENTA)
+        emit_status("evidence", "finished")
 
     # 4) Reviewer + optional refinement loop
     review_notes = ""
@@ -1769,6 +1761,7 @@ def run_multi_agent(
                 break
 
             print_status(f"Reviewer Checking Quality (cycle {cycle})...", color=FG_YELLOW)
+            emit_status("reviewer", "cycle_start", {"cycle": cycle})
             t3 = time.time()
             review_decision = _reviewer_decision_agent(env, content_to_review)
             review_notes = review_decision.review_notes
@@ -1792,11 +1785,13 @@ def run_multi_agent(
                     f"Reviewer Satisfied With Quality. ({time.time() - t3:.2f}s)",
                     color=FG_YELLOW,
                 )
+                emit_status("reviewer", "completed", {"cycle": cycle})
                 break
 
             # If reviewer asks for more work:
             if review_decision.target == "researcher" and decision.use_researcher:
                 print_status("Reviewer Requested Researcher Refinement...", color=FG_GREEN)
+                emit_status("reviewer", "requested_research_refine", {"cycle": cycle})
                 refined_research = _researcher_refine_agent(
                     env=env,
                     plan=decision,
@@ -1813,6 +1808,7 @@ def run_multi_agent(
                     )
                 if decision.use_evidence:
                     print_status("Evidence Analyst Re-verifying After Research Refine...", color=FG_MAGENTA)
+                    emit_status("evidence", "refine_after_research", {"cycle": cycle})
                     refined_evidence = _evidence_agent_env(env, research_summary)
                     evidence_pack = refined_evidence
                     agent_traces[f"evidence_after_research_refine_{cycle}"] = refined_evidence
@@ -1825,6 +1821,7 @@ def run_multi_agent(
 
             elif review_decision.target == "evidence" and decision.use_evidence and research_summary:
                 print_status("Reviewer Requested Evidence Refinement...", color=FG_MAGENTA)
+                emit_status("reviewer", "requested_evidence_refine", {"cycle": cycle})
                 refined_evidence = _evidence_refine_agent(
                     env=env,
                     research_summary=research_summary,
@@ -1841,10 +1838,12 @@ def run_multi_agent(
                     )
             else:
                 print_status("Reviewer Cannot Refine Further, Continuing...", color=FG_YELLOW)
+                emit_status("reviewer", "refine_not_possible", {"cycle": cycle})
                 break
 
     # 5) Final answer – Final Writer (STREAMS if requested)
     print_status("Final Writer Composing Answer...", color=FG_CYAN)
+    emit_status("final", "started")
     t4 = time.time()
     final_initial = _concluder_agent_env(
         env=env,
@@ -1861,6 +1860,7 @@ def run_multi_agent(
     # otherwise the answer is no longer the last thing on screen.
     if not stream_final:
         print_status(f"Final Answer Draft Ready. ({time.time() - t4:.2f}s)", color=FG_CYAN)
+    emit_status("final", "finished")
 
     final_answer = final_initial
 
@@ -1878,9 +1878,11 @@ def run_multi_agent(
         # Keep the UI clean: no judge rewrite, no extra status lines.
         env.log("[judge] skipped (streaming mode: judge disabled to keep final answer last)")
         agent_traces["judge"] = "Judge skipped: streaming mode (no rewrite)."
+        emit_status("judge", "skipped", {"reason": "streaming_mode"})
     else:
         if decision.use_judge and judge_allowed_by_runtime and (research_summary or evidence_pack):
             print_status("Judge Auditing Final Answer...", color=FG_YELLOW)
+            emit_status("judge", "started")
             t5 = time.time()
             verdict = _judge_agent_env(
                 env=env,
@@ -1893,6 +1895,7 @@ def run_multi_agent(
 
             if verdict.needs_rewrite and not verdict.accept:
                 print_status("Judge Requested Rewrite From Final Writer...", color=FG_YELLOW)
+                emit_status("judge", "requested_rewrite")
                 final_answer_rewritten = _concluder_agent_env(
                     env=env,
                     research_summary=research_summary,
@@ -1908,11 +1911,13 @@ def run_multi_agent(
                     f"Final Answer Rewritten After Judge Feedback. ({time.time() - t5:.2f}s)",
                     color=FG_YELLOW,
                 )
+                emit_status("judge", "finished_with_rewrite")
             else:
                 print_status(
                     f"Judge Completed. ({time.time() - t5:.2f}s)",
                     color=FG_YELLOW,
                 )
+                emit_status("judge", "finished")
         else:
             skip_reason = []
             if not decision.use_judge:
@@ -1924,21 +1929,20 @@ def run_multi_agent(
             reason_text = "; ".join(skip_reason) if skip_reason else "Judge skipped by planner/runtime."
             env.log(f"[judge] skipped ({reason_text})")
             agent_traces["judge"] = f"Judge skipped: {reason_text}"
+            emit_status("judge", "skipped", {"reason": reason_text})
 
     agent_traces["final"] = final_answer
 
     # Final environment log dump (debug only)
     if getattr(config.runtime, "debug", False):
-
         try:
             env_log = env.to_log_string()
             agent_traces["env"] = env_log
         except Exception:
             # Never let logging crash the run
             pass
+
     return final_answer, agent_traces
-
-
 
 
 # ---------------------------------------------------------------------------
